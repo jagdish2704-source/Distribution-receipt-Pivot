@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -129,18 +130,102 @@ def generate_pivot_table(df):
     
     return final_pivot
 
-def to_excel(df_processed, df_pivot):
+def generate_site_pivot_table(df):
+    """
+    Generates the pivot table with:
+    - Row: SITE_CODE, Product
+    - Column: SHIP_SITE, Grand Total
+    - Values: QUANTITY, AMOUNT
+    - Subtotals: SITE_CODE-wise
+    """
+    required_cols = ["SITE_CODE", "SHIP_SITE", "QUANTITY", "AMOUNT", "Product"]
+    missing = [c for c in required_cols if c not in df.columns]
+    
+    if missing:
+        st.error(f"Missing columns for Pivot: {missing}")
+        return None
+
+    # Ensure numeric types - Handle commas
+    for col in ["QUANTITY", "AMOUNT"]:
+        df[col] = df[col].astype(str).str.replace(",", "", regex=False)
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Pivot Main (Detailed)
+    pivot_main = pd.pivot_table(
+        df,
+        index=["SITE_CODE", "Product"],
+        columns=["SHIP_SITE"],
+        values=["QUANTITY", "AMOUNT"],
+        aggfunc="sum",
+        fill_value=0
+    )
+    
+    if pivot_main.empty:
+        return None
+
+    # Pivot Subtotals (SITE_CODE-wise)
+    pivot_sub = pd.pivot_table(
+        df,
+        index=["SITE_CODE"],
+        columns=["SHIP_SITE"],
+        values=["QUANTITY", "AMOUNT"],
+        aggfunc="sum",
+        fill_value=0
+    )
+    
+    # Add "Total" level to 'Product' index
+    pivot_sub.index = pd.MultiIndex.from_arrays(
+        [pivot_sub.index, ["Total"] * len(pivot_sub)], 
+        names=["SITE_CODE", "Product"]
+    )
+    
+    # Combine
+    final_pivot = pd.concat([pivot_main, pivot_sub])
+
+    # Custom Sort: Ensure 'Total' appears at the bottom of each SITE_CODE
+    # We create a temporary DataFrame from the index to define the sort order
+    idx = final_pivot.index.to_frame(index=False)
+    idx['is_total'] = idx['Product'] == 'Total'
+    
+    # Sort by: 
+    # 1. SITE_CODE (Ascending)
+    # 2. is_total (False < True, so 'Total' comes last)
+    # 3. Product (Alphabetical for non-totals)
+    idx = idx.sort_values(by=['SITE_CODE', 'is_total', 'Product'])
+    
+    # Reindex the DataFrame based on the new sorted order
+    final_pivot = final_pivot.reindex(pd.MultiIndex.from_frame(idx[['SITE_CODE', 'Product']]))
+    
+    # Swap levels to SHIP_SITE on top (keep consistent structure)
+    final_pivot.columns = final_pivot.columns.swaplevel(0, 1)
+
+    # Calculate Horizontal Totals
+    total_qty = final_pivot.xs('QUANTITY', axis=1, level=1).sum(axis=1)
+    total_amt = final_pivot.xs('AMOUNT', axis=1, level=1).sum(axis=1)
+    
+    # Add Grand Total
+    final_pivot[('Grand Total', 'QUANTITY')] = total_qty
+    final_pivot[('Grand Total', 'AMOUNT')] = total_amt
+    
+    # Sort columns
+    final_pivot.sort_index(axis=1, level=0, inplace=True)
+    
+    return final_pivot
+
+def to_excel(df_processed, df_pivot, df_site_pivot):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         # Sheet 1: Processed Data
         df_processed.to_excel(writer, sheet_name="Processed Data", index=False)
         
-        # Sheet 2: Pivot Table
-        if df_pivot is not None:
+        # Helper function for styling (reused)
+        def style_pivot_sheet(df, sheet_name):
+            if df is None: return
+
             # Sort Columns Logic
-            sites = [s for s in df_pivot.columns.get_level_values(0).unique() if s != "Grand Total"]
+            sites = [s for s in df.columns.get_level_values(0).unique() if s != "Grand Total"]
             sites.sort()
-            if "Grand Total" in df_pivot.columns.get_level_values(0):
+            if "Grand Total" in df.columns.get_level_values(0):
                 sites.append("Grand Total")
             
             sorted_cols = []
@@ -148,8 +233,8 @@ def to_excel(df_processed, df_pivot):
                 sorted_cols.append((site, "QUANTITY"))
                 sorted_cols.append((site, "AMOUNT"))
             
-            existing_cols = [c for c in sorted_cols if c in df_pivot.columns]
-            pivot_sorted = df_pivot[existing_cols]
+            existing_cols = [c for c in sorted_cols if c in df.columns]
+            pivot_sorted = df[existing_cols]
 
             styler = pivot_sorted.style.format("{:,.2f}")
             
@@ -169,14 +254,23 @@ def to_excel(df_processed, df_pivot):
                 return ['']*len(series)
             
             def highlight_totals(series):
-                if series.name[1] == "Total":
-                    return ['font-weight: bold; background-color: #cfcfcf; border-top: 2px solid #555;']*len(series)
+                # Check for "Total" in the index.
+                # Index could be (Product, Site) or (Site, Product)
+                # We check the name tuple for "Total"
+                if "Total" in series.name:
+                     return ['font-weight: bold; background-color: #cfcfcf; border-top: 2px solid #555;']*len(series)
                 return ['']*len(series)
 
             styler.apply(highlight_cols, axis=0)
             styler.apply(highlight_totals, axis=1)
             
-            styler.to_excel(writer, sheet_name="Distribution Pivot")
+            styler.to_excel(writer, sheet_name=sheet_name)
+
+        # Sheet 2: Distribution Pivot
+        style_pivot_sheet(df_pivot, "Distribution Pivot")
+
+        # Sheet 3: Site Wise Pivot
+        style_pivot_sheet(df_site_pivot, "Site Wise Pivot")
             
     return output.getvalue()
 
@@ -185,7 +279,7 @@ def to_excel(df_processed, df_pivot):
 st.set_page_config(page_title="Distribution Details Generator", layout="wide")
 
 st.title("📊 Distribution Details Generator")
-st.markdown("Upload your CSV file to generate the Product column and Distribution Pivot Table with analytics.")
+st.markdown("Upload your CSV file to generate the Product column and Distribution Pivot Tables with analytics.")
 
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv", "txt"])
 
@@ -203,16 +297,30 @@ if uploaded_file is not None:
                     st.dataframe(processed_df.head())
 
         if 'processed_df' in st.session_state:
-            if st.button("Generate Distribution Pivot"):
-                with st.spinner("Creating Pivot Table..."):
+            if st.button("Generate Pivot Tables"):
+                with st.spinner("Creating Pivot Tables..."):
+                    # 1. Product Wise
                     pivot_df = generate_pivot_table(st.session_state['processed_df'])
-                    if pivot_df is not None:
-                        st.session_state['pivot_df'] = pivot_df
-                        st.success("Pivot Table Generated!")
-                        st.dataframe(pivot_df)
+                    # 2. Site Wise
+                    site_pivot_df = generate_site_pivot_table(st.session_state['processed_df'])
 
-            if 'pivot_df' in st.session_state:
-                excel_data = to_excel(st.session_state['processed_df'], st.session_state['pivot_df'])
+                    if pivot_df is not None and site_pivot_df is not None:
+                        st.session_state['pivot_df'] = pivot_df
+                        st.session_state['site_pivot_df'] = site_pivot_df
+                        st.success("Pivot Tables Generated!")
+                        
+                        st.subheader("Product-Wise Pivot")
+                        st.dataframe(pivot_df)
+                        
+                        st.subheader("Site-Wise Pivot")
+                        st.dataframe(site_pivot_df)
+
+            if 'pivot_df' in st.session_state and 'site_pivot_df' in st.session_state:
+                excel_data = to_excel(
+                    st.session_state['processed_df'], 
+                    st.session_state['pivot_df'],
+                    st.session_state['site_pivot_df']
+                )
                 st.download_button(
                     label="📥 Download Excel Report",
                     data=excel_data,
